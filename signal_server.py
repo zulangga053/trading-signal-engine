@@ -15,6 +15,7 @@ from data import get_rates, invalidate_cache, prefetch_pairs
 from analysis import full_analysis, validate_trading_plan
 from display import format_signal_card, check_consistency, format_scan_table, format_pairs_list
 from sdz_engine import get_engine, SDZEngine
+import journal
 
 MODE_HELP = {
     'scalp': 'Fast analysis M1/M5 — 10 major pairs. Valid ~15 menit.',
@@ -105,6 +106,16 @@ def handle_tool_call(req_id: Any, params: dict) -> dict:
             return tool_sdz_scan(req_id, args)
         elif tool_name == 'sdz_logs':
             return tool_sdz_logs(req_id, args)
+        elif tool_name == 'journal_list':
+            return tool_journal_list(req_id, args)
+        elif tool_name == 'journal_stats':
+            return tool_journal_stats(req_id, args)
+        elif tool_name == 'journal_update':
+            return tool_journal_update(req_id, args)
+        elif tool_name == 'journal_export':
+            return tool_journal_export(req_id, args)
+        elif tool_name == 'journal_report':
+            return tool_journal_report(req_id, args)
         else:
             return {
                 'jsonrpc': '2.0',
@@ -428,6 +439,72 @@ def tool_sdz_logs(req_id: Any, args: dict) -> dict:
     return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': '\n'.join(lines)}]}}
 
 
+def tool_journal_list(req_id: Any, args: dict) -> dict:
+    limit = args.get('limit', 10)
+    symbol = args.get('symbol')
+    trades = journal.list_trades(limit=limit, symbol=symbol)
+    lines = [f'Journal — Last {len(trades)} Trades']
+    lines.append(f'{"ID":<4} {"Date":<12} {"Symbol":<10} {"Mode":<10} {"Signal":<12} {"Conf":<6} {"Outcome":<8}')
+    lines.append('-' * 70)
+    for t in trades:
+        dt = t['created_at'][:10] if t['created_at'] else '?'
+        lines.append(f'{t["id"]:<4} {dt:<12} {t["symbol"]:<10} {t["mode"]:<10} '
+                     f'{t["signal"]:<12} {t["confidence"]:<6} {t["outcome"]:<8}')
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': '\n'.join(lines)}]}}
+
+
+def tool_journal_stats(req_id: Any, args: dict) -> dict:
+    days = args.get('days')
+    stats = journal.get_stats(days=days)
+    period = f'last {days}d' if days else 'all time'
+    lines = [f'Journal Stats — {period}']
+    lines.append(f'  Total signals: {stats["total"]}')
+    lines.append(f'  Closed trades: {stats["closed"]}')
+    lines.append(f'  Wins: {stats["wins"]}  |  Losses: {stats["losses"]}  |  Pending: {stats["pending"]}')
+    lines.append(f'  Win rate: {stats["win_rate"]}%')
+    lines.append('')
+    if stats['by_pair']:
+        lines.append('By Pair:')
+        for sym, d in sorted(stats['by_pair'].items(), key=lambda x: x[1]['total'], reverse=True):
+            wr = round(d['wins'] / max(d['wins'] + d['losses'], 1) * 100, 1)
+            lines.append(f'  {sym:<10} {d["total"]} trades  {d["wins"]}W/{d["losses"]}L  {wr}% WR')
+    lines.append('')
+    if stats['by_confidence']:
+        lines.append('By Confidence:')
+        for score, d in sorted(stats['by_confidence'].items()):
+            if d['total'] == 0:
+                continue
+            wr = round(d['wins'] / max(d['wins'] + d['losses'], 1) * 100, 1)
+            lines.append(f'  Score {score:<3} {d["total"]} trades  {d["wins"]}W/{d["losses"]}L  {wr}% WR')
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': '\n'.join(lines)}]}}
+
+
+def tool_journal_update(req_id: Any, args: dict) -> dict:
+    trade_id = args.get('trade_id')
+    outcome = args.get('outcome')
+    pnl = args.get('pnl')
+    notes = args.get('notes', '')
+    if not trade_id or not outcome:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': 'trade_id and outcome required'}}
+    trade = journal.get_trade(trade_id)
+    if not trade:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Trade #{trade_id} not found'}}
+    journal.update_outcome(trade_id, outcome, pnl, notes)
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': f'Journal #{trade_id} updated → {outcome}'}]}}
+
+
+def tool_journal_export(req_id: Any, args: dict) -> dict:
+    path = args.get('path')
+    result_path = journal.export_csv(path)
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': f'CSV exported: {result_path}'}]}}
+
+
+def tool_journal_report(req_id: Any, args: dict) -> dict:
+    days = args.get('days', 7)
+    path = journal.generate_report(days=days)
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': f'Report generated: {path}'}]}}
+
+
 TOOLS = [
     {
         'name': 'get_pairs',
@@ -573,6 +650,61 @@ TOOLS = [
             'required': ['symbol'],
         },
     },
+    {
+        'name': 'journal_list',
+        'description': 'View recent journal entries. Optionally filter by symbol.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'limit': {'type': 'number', 'description': 'Number of entries (default 10)'},
+                'symbol': {'type': 'string', 'description': 'Filter by symbol e.g. EUR/USD'},
+            },
+        },
+    },
+    {
+        'name': 'journal_stats',
+        'description': 'View performance statistics from the trading journal.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'days': {'type': 'number', 'description': 'Period in days (default: all time)'},
+            },
+        },
+    },
+    {
+        'name': 'journal_update',
+        'description': 'Update the outcome of a journal entry after trade is closed.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'trade_id': {'type': 'number', 'description': 'Journal entry ID'},
+                'outcome': {'type': 'string', 'enum': ['win', 'loss', 'pending', 'cancel'], 'description': 'Trade outcome'},
+                'pnl': {'type': 'number', 'description': 'Profit/loss in pips or USD'},
+                'notes': {'type': 'string', 'description': 'Optional notes'},
+            },
+            'required': ['trade_id', 'outcome'],
+        },
+    },
+    {
+        'name': 'journal_export',
+        'description': 'Export journal to CSV file.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'path': {'type': 'string', 'description': 'Output file path (optional, auto-generated)'},
+            },
+        },
+    },
+    {
+        'name': 'journal_report',
+        'description': 'Generate a Markdown trading report for the specified period.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'days': {'type': 'number', 'description': 'Period in days (default 7)'},
+            },
+        },
+    },
 ]
 
 
@@ -580,6 +712,8 @@ def main():
     log('[SIGNAL ENGINE] Starting MCP server on stdio...')
     log(f'[SIGNAL ENGINE] {len(PAIRS)} pairs loaded')
     log('[SIGNAL ENGINE] Modes: scalp (M1/M5), intraday (H1), swing (D1)')
+    log(f'[SIGNAL ENGINE] Journal: {len(TOOLS)} tools | SQLite at {journal.DB_PATH}')
+    log('[SIGNAL ENGINE] Journal report: journal_stats, journal_list, journal_update, journal_export')
 
     buffer = ''
     for line in sys.stdin:

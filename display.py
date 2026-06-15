@@ -1,4 +1,5 @@
 from analysis import INDICATOR_PARAMS
+from journal import save_trade
 
 METHODOLOGY = {
     'ema_alignment': {
@@ -93,6 +94,9 @@ def _signal_emoji(passed, total):
 
 def format_signal_card(result: dict, trading_plan: dict = None, higher_tf: dict = None) -> str:
     lines = []
+    trade_id = save_trade(result)
+    if trade_id:
+        lines.append(f'  \033[90mJournal ID: #{trade_id}\033[0m')
     W = 68
 
     symbol = result.get('symbol', '?')
