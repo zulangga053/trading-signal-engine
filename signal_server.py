@@ -22,7 +22,7 @@ MODE_HELP = {
     'swing': 'Long analysis D1 — 28+ pairs. Valid ~1-7 hari.',
 }
 
-MODE_PERIOD = {'scalp': '5d', 'intraday': '1mo', 'swing': '6mo'}
+MODE_PERIOD = {'scalp': '5d', 'intraday': '1mo', 'swing': '2y'}
 
 running = True
 
@@ -268,7 +268,7 @@ def tool_generate_signal(req_id: Any, args: dict) -> dict:
     result = full_analysis(df_entry, mode, pair.symbol, sdz_result=sdz_result)
 
     try:
-        df_higher = get_rates(pair.yahoo_ticker, higher_tf, '3mo' if mode == 'swing' else '6mo')
+        df_higher = get_rates(pair.yahoo_ticker, higher_tf, '5y' if mode == 'swing' else '6mo')
         sdz_higher = get_engine(f'{pair.symbol}_{higher_tf}')
         sdz_higher_result = sdz_higher.update(df_higher)
         higher = full_analysis(df_higher, mode, f'{symbol} ({higher_tf})', sdz_result=sdz_higher_result)
@@ -282,7 +282,7 @@ def tool_generate_signal(req_id: Any, args: dict) -> dict:
         result['higher_tf'] = {'error': 'cannot_fetch'}
 
     try:
-        df_lower = get_rates(pair.yahoo_ticker, lower_tf, '5d' if mode == 'scalp' else '15d')
+        df_lower = get_rates(pair.yahoo_ticker, lower_tf, '5d' if mode == 'scalp' else '15d' if mode == 'intraday' else '1mo')
         lower = full_analysis(df_lower, mode, f'{symbol} ({lower_tf})')
         result['lower_tf'] = {
             'timeframe': lower_tf,

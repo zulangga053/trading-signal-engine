@@ -61,6 +61,8 @@ def _conf_level(confidence):
 
 
 def _bar(signal):
+    if not signal:
+        return '\u25c6'
     if 'strong_buy' in signal or 'buy' in signal:
         return '\u25b2'
     if 'strong_sell' in signal or 'sell' in signal:
@@ -224,8 +226,11 @@ def format_signal_card(result: dict, trading_plan: dict = None, higher_tf: dict 
     h_sig = ht.get('signal', '?')
     h_conf = ht.get('confidence', '?')
     h_trend = ht.get('trend', '?')
-    h_bar = _bar(h_sig) if h_sig != '?' else '?'
-    lines.append(f'     {h_bar} Signal: {h_sig.upper() if isinstance(h_sig, str) else h_sig}  |  Confidence: {h_conf}/10  |  Trend: {h_trend}')
+    h_bar = _bar(h_sig) if h_sig and h_sig != '?' else '?'
+    h_sig_display = h_sig.upper() if isinstance(h_sig, str) else '?'
+    h_conf_display = h_conf if h_conf is not None else '?'
+    h_trend_display = h_trend if h_trend else '?'
+    lines.append(f'     {h_bar} Signal: {h_sig_display}  |  Confidence: {h_conf_display}/10  |  Trend: {h_trend_display}')
 
     aligned = result.get('multi_tf_aligned', False)
     if aligned:
