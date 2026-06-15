@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+Trading Signal Engine — MCP Server
+Modes: scalp, intraday, swing
+"""
+
+import json
+import sys
+import signal
+import traceback
+from typing import Any
+
+from pairs import PAIRS, get_pair, get_pairs_for_mode, MODE_TF, MODE_PAIRS
+from data import get_rates, invalidate_cache, prefetch_pairs
+from analysis import full_analysis, validate_trading_plan
+from display import format_signal_card, check_consistency, format_scan_table, format_pairs_list
+
+MODE_HELP = {
+    'scalp': 'Fast analysis M1/M5 — 10 major pairs. Valid ~15 menit.',
+    'intraday': 'Medium analysis H1 — 20 pairs. Valid ~1-4 jam.',
+    'swing': 'Long analysis D1 — 28+ pairs. Valid ~1-7 hari.',
+}
+
+MODE_PERIOD = {'scalp': '5d', 'intraday': '1mo', 'swing': '6mo'}
+
+running = True
+
+
+def log(msg: str):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def send_json(data: dict):
+    line = json.dumps(data)
+    sys.stdout.write(line + '\n')
+    sys.stdout.flush()
+
+
+def handle_request(req: dict) -> dict:
+    method = req.get('method', '')
+    req_id = req.get('id')
+    params = req.get('params', {})
+
+    if method == 'initialize':
+        return {
+            'jsonrpc': '2.0',
+            'id': req_id,
+            'result': {
+                'protocolVersion': '2024-11-05',
+                'capabilities': {'tools': {}},
+                'serverInfo': {'name': 'trading-signal-engine', 'version': '2.0.0'},
+            },
+        }
+
+    if method == 'notifications/initialized':
+        return {'jsonrpc': '2.0', 'id': req_id, 'result': {}}
+
+    if method == 'ping':
+        return {'jsonrpc': '2.0', 'id': req_id, 'result': {}}
+
+    if method == 'tools/list':
+        return {
+            'jsonrpc': '2.0',
+            'id': req_id,
+            'result': {'tools': TOOLS},
+        }
+
+    if method == 'tools/call':
+        return handle_tool_call(req_id, params)
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'error': {'code': -32601, 'message': f'Method not found: {method}'},
+    }
+
+
+def handle_tool_call(req_id: Any, params: dict) -> dict:
+    tool_name = params.get('name', '')
+    args = params.get('arguments', {})
+
+    try:
+        if tool_name == 'get_pairs':
+            return tool_get_pairs(req_id, args)
+        elif tool_name == 'get_rates':
+            return tool_get_rates(req_id, args)
+        elif tool_name == 'get_indicators':
+            return tool_get_indicators(req_id, args)
+        elif tool_name == 'analyze_technical':
+            return tool_analyze_technical(req_id, args)
+        elif tool_name == 'scan_markets':
+            return tool_scan_markets(req_id, args)
+        elif tool_name == 'generate_signal':
+            return tool_generate_signal(req_id, args)
+        elif tool_name in ('scalp', 'scan_scalp'):
+            return tool_scan_mode(req_id, 'scalp', args)
+        elif tool_name in ('intraday', 'scan_intraday'):
+            return tool_scan_mode(req_id, 'intraday', args)
+        elif tool_name in ('swing', 'scan_swing'):
+            return tool_scan_mode(req_id, 'swing', args)
+        else:
+            return {
+                'jsonrpc': '2.0',
+                'id': req_id,
+                'error': {'code': -32602, 'message': f'Unknown tool: {tool_name}'},
+            }
+    except Exception as e:
+        log(f'Error in {tool_name}: {traceback.format_exc()}')
+        return {
+            'jsonrpc': '2.0',
+            'id': req_id,
+            'error': {'code': -32000, 'message': str(e)},
+        }
+
+
+def tool_get_pairs(req_id: Any, args: dict) -> dict:
+    category = args.get('category')
+    if category:
+        result = [(p.symbol, p.name, p.category) for p in PAIRS if p.category == category]
+        return {
+            'jsonrpc': '2.0',
+            'id': req_id,
+            'result': {'content': [{'type': 'text', 'text': json.dumps(result, indent=2)}]},
+        }
+    else:
+        grouped = {}
+        for p in PAIRS:
+            grouped.setdefault(p.category, []).append({'symbol': p.symbol, 'name': p.name})
+        return {
+            'jsonrpc': '2.0',
+            'id': req_id,
+            'result': {'content': [{'type': 'text', 'text': format_pairs_list(grouped)}]},
+        }
+
+
+def tool_get_rates(req_id: Any, args: dict) -> dict:
+    symbol = args.get('symbol', '').upper()
+    interval = args.get('interval', '1h')
+    period = args.get('period', '1mo')
+    limit = args.get('limit', 100)
+
+    pair = get_pair(symbol)
+    if not pair:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Unknown pair: {symbol}'}}
+
+    df = get_rates(pair.yahoo_ticker, interval, period)
+    df = df.tail(limit)
+    candles = []
+    for idx, row in df.iterrows():
+        candles.append({
+            'time': str(idx),
+            'open': round(float(row['open']), 5),
+            'high': round(float(row['high']), 5),
+            'low': round(float(row['low']), 5),
+            'close': round(float(row['close']), 5),
+            'volume': round(float(row['volume']), 2),
+        })
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'result': {'content': [{'type': 'text', 'text': json.dumps(candles, indent=2)}]},
+    }
+
+
+def tool_get_indicators(req_id: Any, args: dict) -> dict:
+    symbol = args.get('symbol', '').upper()
+    mode = args.get('mode', 'intraday')
+    interval = args.get('interval', '1h')
+    period = args.get('period', '1mo')
+
+    pair = get_pair(symbol)
+    if not pair:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Unknown pair: {symbol}'}}
+
+    df = get_rates(pair.yahoo_ticker, interval, period)
+    from indicators import compute_indicators
+    ind = compute_indicators(df, mode)
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'result': {'content': [{'type': 'text', 'text': json.dumps(ind, indent=2)}]},
+    }
+
+
+def tool_analyze_technical(req_id: Any, args: dict) -> dict:
+    symbol = args.get('symbol', '').upper()
+    mode = args.get('mode', 'intraday')
+    interval = args.get('interval')
+
+    pair = get_pair(symbol)
+    if not pair:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Unknown pair: {symbol}'}}
+
+    if not interval:
+        interval = MODE_TF[mode][1] if mode in MODE_TF else '1h'
+
+    period = MODE_PERIOD.get(mode, '1mo')
+    df = get_rates(pair.yahoo_ticker, interval, period)
+    result = full_analysis(df, mode, symbol)
+
+    card = format_signal_card(result)
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'result': {'content': [{'type': 'text', 'text': card}]},
+    }
+
+
+def tool_scan_markets(req_id: Any, args: dict) -> dict:
+    mode = args.get('mode', 'intraday')
+    limit = args.get('limit', 5)
+    pairs = get_pairs_for_mode(mode)
+    interval = MODE_TF[mode][1]
+    period = MODE_PERIOD.get(mode, '1mo')
+
+    results = []
+    for pair in pairs[:15]:
+        try:
+            df = get_rates(pair.yahoo_ticker, interval, period)
+            analysis = full_analysis(df, mode, pair.symbol)
+            results.append(analysis)
+        except Exception as e:
+            log(f'Scan error {pair.symbol}: {e}')
+
+    results.sort(key=lambda x: abs(x.get('confluence', {}).get('net_score', 0)), reverse=True)
+
+    card = format_scan_table(results, mode, limit)
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'result': {'content': [{'type': 'text', 'text': card}]},
+    }
+
+
+def tool_generate_signal(req_id: Any, args: dict) -> dict:
+    symbol = args.get('symbol', '').upper()
+    mode = args.get('mode', 'intraday')
+
+    pair = get_pair(symbol)
+    if not pair:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Unknown pair: {symbol}'}}
+
+    tfs = MODE_TF.get(mode, ['1h'])
+    period = MODE_PERIOD.get(mode, '1mo')
+
+    entry_tf = tfs[1] if len(tfs) > 1 else tfs[0]
+    higher_tf = tfs[2] if len(tfs) > 2 else tfs[1] if len(tfs) > 1 else tfs[0]
+    lower_tf = tfs[0]
+
+    df_entry = get_rates(pair.yahoo_ticker, entry_tf, period)
+    result = full_analysis(df_entry, mode, pair.symbol)
+
+    try:
+        df_higher = get_rates(pair.yahoo_ticker, higher_tf, '3mo' if mode == 'swing' else '6mo')
+        higher = full_analysis(df_higher, mode, f'{symbol} ({higher_tf})')
+        result['higher_tf'] = {
+            'timeframe': higher_tf,
+            'signal': higher.get('confluence', {}).get('signal'),
+            'confidence': higher.get('confluence', {}).get('confidence'),
+            'trend': higher.get('indicators', {}).get('ma_alignment'),
+        }
+    except Exception:
+        result['higher_tf'] = {'error': 'cannot_fetch'}
+
+    try:
+        df_lower = get_rates(pair.yahoo_ticker, lower_tf, '5d' if mode == 'scalp' else '15d')
+        lower = full_analysis(df_lower, mode, f'{symbol} ({lower_tf})')
+        result['lower_tf'] = {
+            'timeframe': lower_tf,
+            'signal': lower.get('confluence', {}).get('signal'),
+            'confidence': lower.get('confluence', {}).get('confidence'),
+        }
+    except Exception:
+        result['lower_tf'] = {'error': 'cannot_fetch'}
+
+    tf_aligned = True
+    if 'higher_tf' in result and 'signal' in result['higher_tf']:
+        h_sig = result['higher_tf']['signal']
+        e_sig = result.get('confluence', {}).get('signal')
+        if h_sig and e_sig:
+            h_bull = 'bull' in h_sig or 'buy' in h_sig
+            e_bull = 'bull' in e_sig or 'buy' in e_sig
+            if h_bull != e_bull:
+                tf_aligned = False
+                result['confluence']['confidence'] = round(result['confluence']['confidence'] * 0.7, 1)
+                result['confluence']['signal'] = 'neutral'
+                result['confluence']['reason'] = 'Multi-tf misalignment'
+
+    result['multi_tf_aligned'] = tf_aligned
+    result['multi_tf'] = {
+        'lower': lower_tf,
+        'entry': entry_tf,
+        'higher': higher_tf,
+        'aligned': tf_aligned,
+    }
+
+    entry_ma = result.get('indicators', {}).get('ma_alignment')
+    higher_sig = result.get('higher_tf', {}).get('signal')
+    result['trading_plan'] = validate_trading_plan(
+        ind=result.get('indicators', {}),
+        mode=mode,
+        higher_tf_signal=higher_sig,
+        entry_ma=entry_ma,
+    )
+
+    signal_card = format_signal_card(result, result['trading_plan'], result.get('higher_tf', {}))
+    result['consistency'] = check_consistency(result, result['trading_plan'])
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'result': {'content': [{'type': 'text', 'text': signal_card}]},
+    }
+
+
+def tool_scan_mode(req_id: Any, mode: str, args: dict) -> dict:
+    symbol = args.get('symbol')
+    if symbol:
+        return tool_generate_signal(req_id, {'symbol': symbol, 'mode': mode})
+
+    limit = args.get('limit', 5)
+    pairs = get_pairs_for_mode(mode)
+    interval = MODE_TF[mode][1]
+    period = MODE_PERIOD.get(mode, '1mo')
+
+    log(f'Scanning {mode} — {len(pairs)} pairs')
+    results = []
+
+    for pair in pairs[:15]:
+        try:
+            df = get_rates(pair.yahoo_ticker, interval, period)
+            analysis = full_analysis(df, mode, pair.symbol)
+            score = analysis.get('confluence', {}).get('net_score', 0)
+            results.append((score, analysis))
+        except Exception as e:
+            log(f'  {pair.symbol}: {e}')
+
+    results.sort(key=lambda x: abs(x[0]), reverse=True)
+    top = [r[1] for r in results[:limit]]
+
+    card = format_scan_table(top, mode, limit)
+
+    return {
+        'jsonrpc': '2.0',
+        'id': req_id,
+        'result': {'content': [{'type': 'text', 'text': card}]},
+    }
+
+
+TOOLS = [
+    {
+        'name': 'get_pairs',
+        'description': 'Get supported trading pairs grouped by category, or filter by category',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'category': {
+                    'type': 'string',
+                    'enum': ['major', 'cross', 'exotic', 'commodity', 'crypto'],
+                    'description': 'Filter by category',
+                }
+            },
+        },
+    },
+    {
+        'name': 'get_rates',
+        'description': 'Get OHLCV candles for a pair. Supports 1m,2m,5m,15m,30m,1h,4h,1d,1wk intervals.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'e.g. EUR/USD, XAU/USD, BTC/USD'},
+                'interval': {'type': 'string', 'description': 'Timeframe: 1m,5m,15m,1h,4h,1d,1wk'},
+                'period': {'type': 'string', 'description': 'Period: 5d,1mo,3mo,6mo,1y,2y,5y'},
+                'limit': {'type': 'number', 'description': 'Number of candles'},
+            },
+            'required': ['symbol'],
+        },
+    },
+    {
+        'name': 'get_indicators',
+        'description': 'Get all technical indicators for a pair: RSI, MACD, MA, Bollinger, ATR, Stochastic, ADX, OBV, MFI, patterns.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'e.g. EUR/USD'},
+                'mode': {'type': 'string', 'enum': ['scalp', 'intraday', 'swing'], 'description': 'Trading mode (affects indicator params)'},
+                'interval': {'type': 'string', 'description': 'Timeframe'},
+            },
+            'required': ['symbol'],
+        },
+    },
+    {
+        'name': 'analyze_technical',
+        'description': 'Full technical analysis: 5-layer confluence + scoring + SL/TP levels for a single pair.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'e.g. EUR/USD'},
+                'mode': {'type': 'string', 'enum': ['scalp', 'intraday', 'swing'], 'description': 'Trading mode'},
+                'interval': {'type': 'string', 'description': 'Override timeframe'},
+            },
+            'required': ['symbol'],
+        },
+    },
+    {
+        'name': 'generate_signal',
+        'description': 'Generate complete trade signal: multi-timeframe analysis + entry zone + SL/TP + confidence score + confluence.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'e.g. EUR/USD'},
+                'mode': {'type': 'string', 'enum': ['scalp', 'intraday', 'swing'], 'description': 'Trading mode'},
+            },
+            'required': ['symbol'],
+        },
+    },
+    {
+        'name': 'scan_markets',
+        'description': 'Scan all pairs in a mode and rank by signal strength.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'mode': {'type': 'string', 'enum': ['scalp', 'intraday', 'swing']},
+                'limit': {'type': 'number', 'description': 'Number of top signals'},
+            },
+        },
+    },
+    {
+        'name': 'scalp',
+        'description': f'Fast scalping scan — 11 pairs M5/M15. {MODE_HELP["scalp"]}',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'Optional: single pair analysis'},
+                'limit': {'type': 'number', 'description': 'Top N signals'},
+            },
+        },
+    },
+    {
+        'name': 'intraday',
+        'description': f'Intraday analysis — 17 pairs H1. {MODE_HELP["intraday"]}',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'Optional: single pair analysis'},
+                'limit': {'type': 'number', 'description': 'Top N signals'},
+            },
+        },
+    },
+    {
+        'name': 'swing',
+        'description': f'Swing analysis — 32 pairs D1. {MODE_HELP["swing"]}',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'Optional: single pair analysis'},
+                'limit': {'type': 'number', 'description': 'Top N signals'},
+            },
+        },
+    },
+]
+
+
+def main():
+    log('[SIGNAL ENGINE] Starting MCP server on stdio...')
+    log(f'[SIGNAL ENGINE] {len(PAIRS)} pairs loaded')
+    log('[SIGNAL ENGINE] Modes: scalp (M1/M5), intraday (H1), swing (D1)')
+
+    buffer = ''
+    for line in sys.stdin:
+        if not running:
+            break
+        buffer += line
+        try:
+            req = json.loads(buffer)
+            buffer = ''
+            response = handle_request(req)
+            if response:
+                send_json(response)
+        except json.JSONDecodeError:
+            continue
+        except Exception as e:
+            log(f'Fatal: {traceback.format_exc()}')
+            send_json({'jsonrpc': '2.0', 'error': {'code': -32000, 'message': str(e)}})
+
+
+def shutdown(*_):
+    global running
+    running = False
+    log('[SIGNAL ENGINE] Shutting down...')
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    main()
