@@ -262,7 +262,7 @@ def calculate_confluence(ind: dict, mode: str, sdz_result: dict = None) -> dict:
         'total_weighted': total_weighted,
     }
 
-def calculate_sl_tp(ind: dict, mode: str, signal: str, sdz_triggers: list = None) -> dict:
+def calculate_sl_tp(ind: dict, mode: str, signal: str, sdz_triggers: list = None, sdl_trigger: dict = None) -> dict:
     atr = ind.get('atr', 0)
     close = ind.get('close', 0)
     if atr == 0 or close == 0:
@@ -288,6 +288,37 @@ def calculate_sl_tp(ind: dict, mode: str, signal: str, sdz_triggers: list = None
 
     if sdz_triggers:
         t = sdz_triggers[0]
+        entry_bid = t.get('entry', close)
+        sl_ask = t.get('sl', 0)
+        risk = abs(entry_bid - sl_ask)
+        tp1 = t.get('tp1', 0) if is_buy else t.get('tp1', 0)
+        tp2 = t.get('tp2', 0) if is_buy else t.get('tp2', 0)
+        tp3 = t.get('tp3', 0)
+        sl = sl_ask if is_buy else sl_ask
+        sl_pips = round(risk, 5)
+        tp1_pips = round(abs(tp1 - entry_bid), 5)
+        rr1 = round(tp1_pips / sl_pips, 2) if sl_pips > 0 else 0
+        tp2_pips = round(abs(tp2 - entry_bid), 5)
+        rr2 = round(tp2_pips / sl_pips, 2) if sl_pips > 0 else 0
+        rr_ok = rr1 >= min_rr - 0.02 if min_rr else False
+        return {
+            'entry_zone_high': round(entry_bid * 1.0001, 5),
+            'entry_zone_low': round(entry_bid * 0.9999, 5),
+            'sl': round(sl_ask, 5),
+            'tp1': round(tp1, 5),
+            'tp2': round(tp2, 5),
+            'sl_pips': sl_pips,
+            'tp1_pips': tp1_pips,
+            'rr1': rr1,
+            'rr2': rr2,
+            'min_rr': min_rr,
+            'rr_ok': rr_ok,
+            'atr_used': atr,
+            'sdz_entry': True,
+        }
+
+    if sdl_trigger:
+        t = sdl_trigger
         entry_bid = t.get('entry', close)
         sl_ask = t.get('sl', 0)
         risk = abs(entry_bid - sl_ask)
@@ -366,17 +397,25 @@ def validate_trading_plan(ind: dict, mode: str, higher_tf_signal: str = None, en
 
     sdz_triggers = []
     sdz_active = False
-    if sdz_result and sdz_result.get('status') == 'active':
+    sdl_active = False
+    sdl_trigger = None
+    if sdz_result:
         sdz_triggers = sdz_result.get('triggers', [])
-        sdz_active = True
+        sdz_active = sdz_result.get('status') == 'active'
+        sdl_active = sdz_result.get('sdl_active', False)
+        sdl_trigger = sdz_result.get('sdl_trigger')
 
-    timing_pass = sdz_active and len(sdz_triggers) > 0
-    if sdz_active:
-        if sdz_triggers:
-            t = sdz_triggers[0]
-            timing_detail = f"SDZ trigger: {t['direction'].upper()} ({t['confirmation']}) at {t['zone_type']} zone"
-        else:
-            timing_detail = 'SDZ active — no trigger (zone proximity tanpa konfirmasi reversal)'
+    timing_pass = (sdz_active and len(sdz_triggers) > 0) or (sdl_active and sdl_trigger is not None)
+    if sdz_active and len(sdz_triggers) > 0:
+        t = sdz_triggers[0]
+        timing_detail = f"SDZ trigger: {t['direction'].upper()} ({t['confirmation']}) at {t['zone_type']} zone"
+    elif sdl_active and sdl_trigger:
+        t = sdl_trigger
+        timing_detail = f"SDL trigger: {t['direction'].upper()} ({t['confirmation']}) at {t['zone_type']} zone"
+    elif sdz_active:
+        timing_detail = 'SDZ active — no trigger (zone proximity tanpa konfirmasi reversal)'
+    elif sdl_active:
+        timing_detail = 'SDL active — no trigger (S/R proximity tanpa reversal)'
     else:
         timing_detail = 'SDZ engine not ready'
 
@@ -427,8 +466,10 @@ def full_analysis(df: pd.DataFrame, mode: str, symbol: str, sdz_result: dict = N
         return {'error': ind['error']}
 
     confluence = calculate_confluence(ind, mode, sdz_result)
+    sdz_triggers = sdz_result.get('triggers') if sdz_result else None
+    sdl_trigger = sdz_result.get('sdl_trigger') if sdz_result else None
     sl_tp = calculate_sl_tp(ind, mode, confluence['signal'],
-                            sdz_result.get('triggers') if sdz_result else None)
+                            sdz_triggers=sdz_triggers, sdl_trigger=sdl_trigger)
 
     if 'error' not in sl_tp and not sl_tp.get('rr_ok', True):
         confluence['confidence'] = round(confluence['confidence'] * 0.7, 1)
