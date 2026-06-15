@@ -132,8 +132,6 @@ def compute_indicators(df: pd.DataFrame, mode: str) -> dict:
     vol_sma_series = ta.trend.SMAIndicator(pd.Series(volume) if volume is not None else pd.Series([0]), window=20).sma_indicator()
     result['volume_ratio'] = round(result['volume'] / float(vol_sma_series.dropna().iloc[-1]), 2) if not vol_sma_series.dropna().empty and float(vol_sma_series.dropna().iloc[-1]) > 0 else 1.0
 
-    result['pattern'] = _detect_pattern(df)
-
     hi_idx = _swing_high(low, high, 5)
     lo_idx = _swing_low(low, high, 5)
     if low is not None and len(low) > 0:
@@ -150,18 +148,6 @@ def compute_indicators(df: pd.DataFrame, mode: str) -> dict:
     result['s1'] = round(2 * pivot - (float(high[-1]) if len(high) > 0 else 0), 5)
 
     result['trend_structure'] = _detect_trend_structure(high, low, close)
-    result['supply_demand'] = _detect_supply_demand(high, low, close)
-    result['fvg'] = _detect_fvg(high, low, close)
-
-    for zone in result['supply_demand']:
-        zone['distance'] = float(zone['distance'])
-        zone['zone_low'] = float(zone['zone_low'])
-        zone['zone_high'] = float(zone['zone_high'])
-    for f in result['fvg']:
-        f['distance'] = float(f['distance'])
-        f['gap_low'] = float(f['gap_low'])
-        f['gap_high'] = float(f['gap_high'])
-        f['gap_size'] = float(f['gap_size'])
 
     return result
 
@@ -228,43 +214,6 @@ def _obv_trend(obv_vals):
         return 'falling'
     return 'flat'
 
-def _detect_pattern(df):
-    close = df['close'].values
-    open_ = df['open'].values
-    high = df['high'].values
-    low = df['low'].values
-    if len(close) < 2:
-        return 'none'
-
-    c, o, h, l = close[-1], open_[-1], high[-1], low[-1]
-    pc = close[-2] if len(close) > 1 else c
-    po = open_[-2] if len(open_) > 1 else o
-    body = abs(c - o)
-    pbody = abs(pc - po)
-    upper_w = h - max(c, o)
-    lower_w = min(c, o) - l
-    avg_body = body if body > 0 else 0.0001
-
-    if body < (h - l) * 0.1 and upper_w > body * 2 and lower_w > body * 2:
-        return 'doji'
-    if c > o and po > pc and c > po and o > pc:
-        return 'bullish_engulfing'
-    if c < o and po < pc and c < po and o < pc:
-        return 'bearish_engulfing'
-    if body < pbody * 0.3 and c > pc and lower_w > body * 2 and upper_w < body:
-        return 'hammer'
-    if body < pbody * 0.3 and c < pc and upper_w > body * 2 and lower_w < body:
-        return 'shooting_star'
-    if c > o and pc > po and c > pc and o < po:
-        return 'morning_star'
-    if c < o and pc < po and c < pc and o > po:
-        return 'evening_star'
-    if c > o and o <= l + body * 0.5 and c >= h - body * 0.5:
-        return 'marubozu_bullish'
-    if c < o and c <= l + body * 0.5 and o >= h - body * 0.5:
-        return 'marubozu_bearish'
-    return 'none'
-
 def _swing_high(low, high, window=5):
     idx = []
     if low is None or high is None or len(low) < window * 2 + 1:
@@ -327,142 +276,4 @@ def _detect_trend_structure(high, low, close, lookback=20):
     return result
 
 
-def _detect_supply_demand(high, low, close, lookback=10, threshold=0.002):
-    """Detect Supply & Demand zones from swing points + impulsive moves.
 
-    Refinements:
-    - Minimum impulsive move: 1.5× avg_range (was 1.0) to filter noise.
-    - Zone width capped at 0.5× avg_range to avoid massive fuzzy zones.
-    - Overlapping zones of the same type are merged (stronger absorbs weaker).
-    - Output capped at 3 best zones (was 4) with strength >= 2 preferred.
-    """
-    zones = []
-    n = len(close)
-    if n < lookback * 3:
-        return zones
-
-    avg_range = float(np.mean(high[-20:] - low[-20:])) if n >= 20 else float(high[-1] - low[-1])
-    if avg_range <= 0:
-        return zones
-    half_range = avg_range * 0.5
-
-    lo_idx = _swing_low(low, high, lookback // 2)
-    hi_idx = _swing_high(low, high, lookback // 2)
-
-    for idx in lo_idx:
-        if idx + 2 >= n: continue
-        reaction = max(high[idx + 1: idx + 3]) - low[idx]
-        ratio = reaction / avg_range if avg_range > 0 else 0
-        if ratio <= 1.5:
-            continue
-        zone_high = min(max(high[idx - lookback // 2: idx + 1]), low[idx] + half_range) if idx >= lookback // 2 else low[idx] + half_range
-        if zone_high <= low[idx]:
-            zone_high = low[idx] + avg_range * 0.3
-        strength = 1 if ratio < 2.5 else 2 if ratio < 4.0 else 3
-        zones.append({
-            'type': 'demand', 'zone_low': float(low[idx]), 'zone_high': float(zone_high),
-            'strength': strength, 'distance': abs(float(close[-1] - low[idx])),
-        })
-
-    for idx in hi_idx:
-        if idx + 2 >= n: continue
-        reaction = high[idx] - min(low[idx + 1: idx + 3])
-        ratio = reaction / avg_range if avg_range > 0 else 0
-        if ratio <= 1.5:
-            continue
-        zone_low = max(min(low[idx - lookback // 2: idx + 1]), high[idx] - half_range) if idx >= lookback // 2 else high[idx] - half_range
-        if zone_low >= high[idx]:
-            zone_low = high[idx] - avg_range * 0.3
-        strength = 1 if ratio < 2.5 else 2 if ratio < 4.0 else 3
-        zones.append({
-            'type': 'supply', 'zone_low': float(zone_low), 'zone_high': float(high[idx]),
-            'strength': strength, 'distance': abs(float(high[idx] - close[-1])),
-        })
-
-    merged = []
-    for z in sorted(zones, key=lambda x: x['distance']):
-        dup = False
-        for m in merged:
-            if z['type'] != m['type']:
-                continue
-            overlap = max(m['zone_low'], z['zone_low']) < min(m['zone_high'], z['zone_high'])
-            if overlap:
-                dup = True
-                if z['strength'] > m['strength']:
-                    m.update(z)
-                break
-        if not dup:
-            merged.append(z)
-
-    merged.sort(key=lambda z: (-z['strength'], z['distance']))
-    return merged[:3]
-
-
-def _detect_fvg(high, low, close):
-    """Detect Fair Value Gaps (3-candle imbalance pattern).
-
-    Refinements:
-    - Minimum gap size: 0.3× avg_range (10-candle) to filter noise.
-    - Only gaps within last 20 candles (recency filter).
-    - Overlapping gaps of same type are merged (wider absorbs narrower).
-    - Sorted by quality = gap_size × proximity_weight.
-    """
-    fvg_list = []
-    n = len(close)
-    if n < 10:
-        return fvg_list
-
-    avg_range = float(np.mean(high[-10:] - low[-10:])) if n >= 10 else float(high[-1] - low[-1])
-    min_gap = avg_range * 0.3 if avg_range > 0 else 0
-    lookback = min(n, 20)
-
-    for i in range(n - 3):
-        h1, l1 = float(high[i]), float(low[i])
-        h3, l3 = float(high[i + 2]), float(low[i + 2])
-
-        gap_high = gap_low = 0.0
-        fvg_type = ''
-        if l1 > h3:
-            fvg_type, gap_high, gap_low = 'bullish_fvg', l1, h3
-        elif h1 < l3:
-            fvg_type, gap_high, gap_low = 'bearish_fvg', l3, h1
-
-        if not fvg_type:
-            continue
-        gap_size = gap_high - gap_low
-        if gap_size < min_gap:
-            continue
-
-        mid = (gap_high + gap_low) / 2
-        dist = abs(float(close[-1]) - mid)
-        # recency: penalize old gaps
-        age_penalty = (n - i) / n
-        score = gap_size / (dist + 0.0001) * max(0.1, 1.0 - age_penalty)
-
-        fvg_list.append({
-            'type': fvg_type,
-            'gap_high': gap_high,
-            'gap_low': gap_low,
-            'gap_size': gap_size,
-            'distance': dist,
-            'idx': i,
-            'score': score,
-        })
-
-    merged = []
-    for f in sorted(fvg_list, key=lambda x: -x['score']):
-        dup = False
-        for m in merged:
-            if f['type'] != m['type']:
-                continue
-            overlap = max(m['gap_low'], f['gap_low']) < min(m['gap_high'], f['gap_high'])
-            if overlap:
-                dup = True
-                if f['gap_size'] > m['gap_size']:
-                    m.update(f)
-                break
-        if not dup:
-            merged.append(f)
-
-    merged.sort(key=lambda x: -x['score'])
-    return merged[:3]

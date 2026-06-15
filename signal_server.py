@@ -14,6 +14,7 @@ from pairs import PAIRS, get_pair, get_pairs_for_mode, MODE_TF, MODE_PAIRS
 from data import get_rates, invalidate_cache, prefetch_pairs
 from analysis import full_analysis, validate_trading_plan
 from display import format_signal_card, check_consistency, format_scan_table, format_pairs_list
+from sdz_engine import get_engine, SDZEngine
 
 MODE_HELP = {
     'scalp': 'Fast analysis M1/M5 — 10 major pairs. Valid ~15 menit.',
@@ -98,6 +99,12 @@ def handle_tool_call(req_id: Any, params: dict) -> dict:
             return tool_scan_mode(req_id, 'intraday', args)
         elif tool_name in ('swing', 'scan_swing'):
             return tool_scan_mode(req_id, 'swing', args)
+        elif tool_name == 'sdz_zones':
+            return tool_sdz_zones(req_id, args)
+        elif tool_name == 'sdz_scan':
+            return tool_sdz_scan(req_id, args)
+        elif tool_name == 'sdz_logs':
+            return tool_sdz_logs(req_id, args)
         else:
             return {
                 'jsonrpc': '2.0',
@@ -198,7 +205,9 @@ def tool_analyze_technical(req_id: Any, args: dict) -> dict:
 
     period = MODE_PERIOD.get(mode, '1mo')
     df = get_rates(pair.yahoo_ticker, interval, period)
-    result = full_analysis(df, mode, symbol)
+    sdz = get_engine(pair.symbol)
+    sdz_result = sdz.update(df)
+    result = full_analysis(df, mode, symbol, sdz_result=sdz_result)
 
     card = format_signal_card(result)
 
@@ -220,7 +229,9 @@ def tool_scan_markets(req_id: Any, args: dict) -> dict:
     for pair in pairs[:15]:
         try:
             df = get_rates(pair.yahoo_ticker, interval, period)
-            analysis = full_analysis(df, mode, pair.symbol)
+            sdz = get_engine(pair.symbol)
+            sdz_result = sdz.update(df)
+            analysis = full_analysis(df, mode, pair.symbol, sdz_result=sdz_result)
             results.append(analysis)
         except Exception as e:
             log(f'Scan error {pair.symbol}: {e}')
@@ -252,11 +263,15 @@ def tool_generate_signal(req_id: Any, args: dict) -> dict:
     lower_tf = tfs[0]
 
     df_entry = get_rates(pair.yahoo_ticker, entry_tf, period)
-    result = full_analysis(df_entry, mode, pair.symbol)
+    sdz = get_engine(pair.symbol)
+    sdz_result = sdz.update(df_entry)
+    result = full_analysis(df_entry, mode, pair.symbol, sdz_result=sdz_result)
 
     try:
         df_higher = get_rates(pair.yahoo_ticker, higher_tf, '3mo' if mode == 'swing' else '6mo')
-        higher = full_analysis(df_higher, mode, f'{symbol} ({higher_tf})')
+        sdz_higher = get_engine(f'{pair.symbol}_{higher_tf}')
+        sdz_higher_result = sdz_higher.update(df_higher)
+        higher = full_analysis(df_higher, mode, f'{symbol} ({higher_tf})', sdz_result=sdz_higher_result)
         result['higher_tf'] = {
             'timeframe': higher_tf,
             'signal': higher.get('confluence', {}).get('signal'),
@@ -331,13 +346,15 @@ def tool_scan_mode(req_id: Any, mode: str, args: dict) -> dict:
     results = []
 
     for pair in pairs[:15]:
-        try:
-            df = get_rates(pair.yahoo_ticker, interval, period)
-            analysis = full_analysis(df, mode, pair.symbol)
-            score = analysis.get('confluence', {}).get('net_score', 0)
-            results.append((score, analysis))
-        except Exception as e:
-            log(f'  {pair.symbol}: {e}')
+            try:
+                df = get_rates(pair.yahoo_ticker, interval, period)
+                sdz = get_engine(pair.symbol)
+                sdz_result = sdz.update(df)
+                analysis = full_analysis(df, mode, pair.symbol, sdz_result=sdz_result)
+                score = analysis.get('confluence', {}).get('net_score', 0)
+                results.append((score, analysis))
+            except Exception as e:
+                log(f'  {pair.symbol}: {e}')
 
     results.sort(key=lambda x: abs(x[0]), reverse=True)
     top = [r[1] for r in results[:limit]]
@@ -349,6 +366,66 @@ def tool_scan_mode(req_id: Any, mode: str, args: dict) -> dict:
         'id': req_id,
         'result': {'content': [{'type': 'text', 'text': card}]},
     }
+
+
+def tool_sdz_zones(req_id: Any, args: dict) -> dict:
+    symbol = args.get('symbol', '').upper()
+    pair = get_pair(symbol)
+    if not pair:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Unknown pair: {symbol}'}}
+    sdz = get_engine(pair.symbol)
+    status = sdz.get_status()
+    zones = sdz.get_zones()
+    triggers = sdz.get_triggers()
+    lines = [f'SDZ Engine — {symbol}', f'Status: {status["status"]}', f'Regime: {status["regime"]["trend"]}',
+             f'ATR: {status["atr"]:.6f}', f'Total zones: {status["total_zones"]}',
+             f'Active triggers: {status["active_triggers"]}', '']
+    for ztype in ('supply', 'demand'):
+        for z in zones.get(ztype, []):
+            lines.append(f'{ztype.upper()} zone: {z["zone_low"]:.5f}-{z["zone_high"]:.5f} momentum={z["momentum"]:.1f}×ATR')
+    for t in triggers:
+        lines.append(f'\nTRIGGER: {t["direction"].upper()} | {t["confirmation"]} | entry={t["entry"]:.5f} sl={t["sl"]:.5f}')
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': '\n'.join(lines)}]}}
+
+
+def tool_sdz_scan(req_id: Any, args: dict) -> dict:
+    mode = args.get('mode', 'intraday')
+    pairs = get_pairs_for_mode(mode)
+    interval = MODE_TF[mode][1]
+    period = MODE_PERIOD.get(mode, '1mo')
+    limit = args.get('limit', 5)
+    results = []
+    for pair in pairs[:15]:
+        try:
+            df = get_rates(pair.yahoo_ticker, interval, period)
+            sdz = get_engine(pair.symbol)
+            sdz_result = sdz.update(df)
+            results.append((pair.symbol, sdz_result))
+        except Exception as e:
+            log(f'SDZ scan {pair.symbol}: {e}')
+    results.sort(key=lambda x: x[1].get('total_zones', 0) if x[1] else 0, reverse=True)
+    lines = [f'SDZ Scan — {mode.upper()}']
+    for sym, r in results[:limit]:
+        reg = r.get('regime', {}).get('trend', '?')
+        nz = r.get('total_zones', 0)
+        nt = len(r.get('triggers', []))
+        s = r.get('status', '?')
+        lines.append(f'{sym:<12} status={s:<10} zones={nz:<2} triggers={nt:<1} regime={reg}')
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': '\n'.join(lines)}]}}
+
+
+def tool_sdz_logs(req_id: Any, args: dict) -> dict:
+    symbol = args.get('symbol', '').upper()
+    pair = get_pair(symbol)
+    if not pair:
+        return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': f'Unknown pair: {symbol}'}}
+    n = args.get('n', 10)
+    sdz = get_engine(pair.symbol)
+    logs = sdz.get_logs(n)
+    lines = [f'SDZ Logs — {symbol} (last {len(logs)})']
+    for entry in logs:
+        lines.append(str(entry))
+    return {'jsonrpc': '2.0', 'id': req_id, 'result': {'content': [{'type': 'text', 'text': '\n'.join(lines)}]}}
 
 
 TOOLS = [
@@ -460,6 +537,40 @@ TOOLS = [
                 'symbol': {'type': 'string', 'description': 'Optional: single pair analysis'},
                 'limit': {'type': 'number', 'description': 'Top N signals'},
             },
+        },
+    },
+    {
+        'name': 'sdz_zones',
+        'description': 'View active SDZ zones and entry triggers for a symbol.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'e.g. EUR/USD'},
+            },
+            'required': ['symbol'],
+        },
+    },
+    {
+        'name': 'sdz_scan',
+        'description': 'Scan all pairs in a mode for SDZ zone activity and triggers.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'mode': {'type': 'string', 'enum': ['scalp', 'intraday', 'swing']},
+                'limit': {'type': 'number', 'description': 'Number of top results'},
+            },
+        },
+    },
+    {
+        'name': 'sdz_logs',
+        'description': 'View SDZ engine logs for a symbol.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'symbol': {'type': 'string', 'description': 'e.g. EUR/USD'},
+                'n': {'type': 'number', 'description': 'Number of log entries'},
+            },
+            'required': ['symbol'],
         },
     },
 ]

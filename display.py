@@ -11,10 +11,10 @@ METHODOLOGY = {
         'rule': '30 \u2264 RSI \u2264 70',
         'why': 'Mencegah entry di zona overbought (RSI >70) atau oversold (RSI <30). RSI 30-70 adalah "sweet spot" di mana momentum masih sehat dan harga memiliki ruang untuk bergerak.',
     },
-    'reversal_at_level': {
+    'sdz_trigger': {
         'name': 'Timing Filter',
-        'rule': 'Candlestick reversal pattern di support/resistance',
-        'why': 'Pattern reversal di level kunci (support untuk buy, resistance untuk sell) memberikan konfirmasi harga membalik. Tanpa ini, entry seperti "menebak" tanpa konfirmasi price action.',
+        'rule': 'SDZ entry trigger aktif (zone rejection + reversal confirmation + volume)',
+        'why': 'SDZ Engine mendeteksi supply/demand zone dari engulfing pattern, memvalidasi dengan momentum impulsif (≥2×ATR), dan menunggu konfirmasi reversal (pin/engulfing/inside bar) + volume spike sebelum trigger entry. Tanpa trigger aktif, entry adalah "menebak" tanpa konfirmasi price action.',
     },
     'higher_tf_aligned': {
         'name': 'Context Filter',
@@ -49,7 +49,7 @@ LAYER_ICONS = {
 
 LAYER_NAMES = {
     'trend': 'TREND', 'momentum': 'MOMENTUM', 'volatility': 'VOLATILITY',
-    'volume': 'VOLUME', 'pattern': 'PATTERN',
+    'volume': 'VOLUME', 'pattern': 'SDZ (SUPPLY/DEMAND)',
 }
 
 
@@ -151,32 +151,44 @@ def format_signal_card(result: dict, trading_plan: dict = None, higher_tf: dict 
 
     lines.append('')
 
-    ts = ind.get('trend_structure', {})
-    sd = ind.get('supply_demand', [])
-    fvg = ind.get('fvg', [])
-    has_structure = ts.get('structure', 'neutral') != 'neutral' or sd or fvg
-    if has_structure:
-        lines.append(f'  \033[1;34mSTRUCTURAL ANALYSIS\033[0m')
+    sdz = result.get('sdz')
+    if sdz and sdz.get('status') == 'active':
+        regime = sdz.get('regime', {})
+        r_trend = regime.get('trend', 'RANGE_BOUND') if regime else 'RANGE_BOUND'
+        r_slope = regime.get('slope', 0.0) if regime else 0.0
+        r_color = '\033[92m' if r_trend == 'BULLISH_TREND' else '\033[91m' if r_trend == 'BEARISH_TREND' else '\033[93m'
+        lines.append(f'  \033[1;34mSDZ ENGINE STATUS\033[0m')
         lines.append(f'  \033[34m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\033[0m')
-        if ts.get('structure') == 'bullish':
-            lines.append(f'     \033[92m\u25b2 Trend Structure: HH/HL ({ts.get("hh_count", 0)}x) \u2192 Bullish\033[0m')
-        elif ts.get('structure') == 'bearish':
-            lines.append(f'     \033[91m\u25bc Trend Structure: LH/LL ({ts.get("lh_count", 0)}x) \u2192 Bearish\033[0m')
-        for zone in sd[:2]:
-            zt = zone.get('type', '')
-            zs = zone.get('strength', 1)
-            zl = zone.get('zone_low', 0)
-            zh = zone.get('zone_high', 0)
-            col = '\033[92m' if zt == 'demand' else '\033[91m'
-            sym = '\u25b2' if zt == 'demand' else '\u25bc'
-            lines.append(f'     {col}{sym} {zt.upper()} Zone: ${zl:.5f} - ${zh:.5f} (strength {zs})\033[0m')
-        for f in fvg[:2]:
-            ft = f.get('type', '')
-            fl = f.get('gap_low', 0)
-            fh = f.get('gap_high', 0)
-            fs = f.get('gap_size', 0)
-            col = '\033[92m' if 'bullish' in ft else '\033[91m'
-            lines.append(f'     {col}FVG ({ft.replace("_"," ")}): ${fl:.5f} - ${fh:.5f} (gap ${fs:.5f})\033[0m')
+        lines.append(f'     Market Regime: {r_color}{r_trend}\033[0m (slope {r_slope:+.6f})')
+        lines.append(f'     Active Zones: {sdz.get("supply_zones", "?")} supply + {sdz.get("demand_zones", "?")} demand')
+        atr_val = sdz.get('atr', 0)
+
+        zones_data = sdz.get('zones', {}) or {}
+        for ztype, color, sym in [('supply', '\033[91m', '\u25bc'), ('demand', '\033[92m', '\u25b2')]:
+            for z in zones_data.get(ztype, [])[:3]:
+                zl = z.get('zone_low', 0)
+                zh = z.get('zone_high', 0)
+                mom = z.get('momentum', 0)
+                age = z.get('age', 0)
+                lines.append(f'     {color}{sym} {ztype.upper()} Zone: ${zl:.5f}-${zh:.5f} | age:{age} | mom:{mom:.1f}×ATR\033[0m')
+
+        triggers = sdz.get('triggers', []) or []
+        if triggers:
+            t = triggers[0]
+            t_color = '\033[92m' if t['direction'] == 'buy' else '\033[91m'
+            lines.append(f'     {t_color}\u2713 {t["direction"].upper()} TRIGGER: {t["zone_type"].upper()} zone rejection\033[0m')
+            lines.append(f'       Confirmation: {t["confirmation"]} | momentum: {t["momentum"]}×ATR')
+            entry_str = f'Entry: ${t["entry"]:.5f}' if t.get('entry') else ''
+            sl_str = f'SL: ${t["sl"]:.5f}' if t.get('sl') else ''
+            tp1_str = f'TP1: ${t["tp1"]:.5f}' if t.get('tp1') else ''
+            tp2_str = f'TP2: ${t["tp2"]:.5f}' if t.get('tp2') else ''
+            lines.append(f'       {entry_str} | {sl_str} | {tp1_str} | {tp2_str}')
+        else:
+            lines.append(f'     \033[90mNo active trigger — waiting for confirmation\033[0m')
+        lines.append('')
+    elif sdz and sdz.get('status'):
+        lines.append(f'  \033[1;34mSDZ ENGINE\033[0m')
+        lines.append(f'     Status: {sdz["status"]} (warming up — need more data)')
         lines.append('')
 
     lines.append(f'  \033[1;34mEXECUTION PLAN\033[0m')
@@ -233,7 +245,7 @@ def format_signal_card(result: dict, trading_plan: dict = None, higher_tf: dict 
         if not cond1.get('pass', False):
             consistency_issues.append(('\u26a0\ufe0f', 'Trend Filter tidak lolos', f'Signal {signal_label} dari konfluensi tetapi EMA tidak bullish. Periksa apakah signal benar-benar searah.'))
         if not cond3.get('pass', False):
-            consistency_issues.append(('\u26a0\ufe0f', 'Timing Filter tidak lolos', 'Tidak ada reversal pattern di level. Entry tanpa konfirmasi price action.'))
+            consistency_issues.append(('\u26a0\ufe0f', 'Timing Filter tidak lolos', 'Tidak ada SDZ trigger aktif. Entry tanpa konfirmasi price action + volume dari SDZ Engine.'))
         if tp_pass >= tp_total - 1:
             consistency_issues.append(('\u2705', 'Trading Plan lolos', f'{tp_pass}/{tp_total} kondisi terpenuhi. Setup layak dieksekusi.'))
 
@@ -355,8 +367,10 @@ def format_scan_table(results: list, mode: str, limit: int = 5) -> str:
         ind = r.get('indicators', {})
         ma = ind.get('ma_alignment', '?')
         rsi = ind.get('rsi', '?')
-        pat = ind.get('pattern', 'none')
-        lines.append(f'     MA: {ma}  |  RSI: {rsi}  |  Pattern: {pat}')
+        sdz = r.get('sdz', {})
+        sdz_status = sdz.get('status', 'inactive') if sdz else 'inactive'
+        sdz_str = f'SDZ: {sdz_status}' if sdz_status != 'inactive' else 'SDZ: init'
+        lines.append(f'     MA: {ma}  |  RSI: {rsi}  |  {sdz_str}')
 
         lines.append('')
 

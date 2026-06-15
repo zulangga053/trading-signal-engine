@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from indicators import compute_indicators, INDICATOR_PARAMS
+from sdz_engine import score_sdz
 
 LAYER_WEIGHTS = {
     'scalp': {'trend': 2.0, 'momentum': 1.5, 'volatility': 1.0, 'volume': 0.5, 'pattern': 1.5},
@@ -211,87 +212,13 @@ def score_volume(ind: dict, mode: str) -> tuple[int, str]:
 
     return max(-2, min(2, score)), ', '.join(reasons) if reasons else 'neutral'
 
-def score_pattern(ind: dict, mode: str) -> tuple[int, str]:
-    score = 0
-    reasons = []
-    pat = ind.get('pattern', 'none')
-
-    bullish_patterns = ['bullish_engulfing', 'hammer', 'morning_star', 'marubozu_bullish']
-    bearish_patterns = ['bearish_engulfing', 'shooting_star', 'evening_star', 'marubozu_bearish']
-    reversal_patterns = ['bullish_engulfing', 'bearish_engulfing', 'hammer', 'shooting_star', 'morning_star', 'evening_star']
-    rejection_patterns = ['hammer', 'shooting_star', 'doji']
-
-    close = ind.get('close', 0)
-    s1 = ind.get('support_1', 0)
-    r1 = ind.get('resistance_1', 0)
-    at_support = s1 and close and abs(close - s1) / close < 0.005
-    at_resistance = r1 and close and abs(r1 - close) / close < 0.005
-
-    if pat in bullish_patterns:
-        is_engulfing = pat == 'bullish_engulfing'
-        is_rejection = pat in rejection_patterns and pat != 'doji'
-        base = 3 if is_engulfing else 2 if is_rejection else 2
-        score += base
-        reasons.append(f'Pattern: {pat}' + (' (engulfing)' if is_engulfing else ''))
-        if at_support:
-            score += 2
-            reasons.append('Bullish reversal at support')
-    elif pat in bearish_patterns:
-        is_engulfing = pat == 'bearish_engulfing'
-        is_rejection = pat in rejection_patterns and pat != 'doji'
-        base = -3 if is_engulfing else -2 if is_rejection else -2
-        score += base
-        reasons.append(f'Pattern: {pat}' + (' (engulfing)' if is_engulfing else ''))
-        if at_resistance:
-            score -= 2
-            reasons.append('Bearish reversal at resistance')
-    elif pat == 'doji':
-        score += 0.5
-        reasons.append('Pattern: doji (indecision)')
-
-    if at_support and pat not in bullish_patterns:
-        score += 1
-        reasons.append('Price at support')
-    if at_resistance and pat not in bearish_patterns:
-        score -= 1
-        reasons.append('Price at resistance')
-
-    sd = ind.get('supply_demand', [])
-    for zone in sd:
-        ztype = zone.get('type', '')
-        zlow = zone.get('zone_low', 0)
-        zhigh = zone.get('zone_high', 0)
-        strength = zone.get('strength', 1)
-        if ztype == 'demand' and zlow <= close <= zhigh * 1.01:
-            bonus = 1 + (strength - 1) * 0.5
-            score += bonus
-            reasons.append(f'Demand zone (strength {strength})')
-        elif ztype == 'supply' and zhigh >= close >= zlow * 0.99:
-            bonus = 1 + (strength - 1) * 0.5
-            score -= bonus
-            reasons.append(f'Supply zone (strength {strength})')
-
-    fvg_list = ind.get('fvg', [])
-    for fvg in fvg_list:
-        ft = fvg.get('type', '')
-        gh = fvg.get('gap_high', 0)
-        gl = fvg.get('gap_low', 0)
-        if ft == 'bullish_fvg' and gl <= close <= gh:
-            score += 1
-            reasons.append('FVG imbalance (bullish gap)')
-        elif ft == 'bearish_fvg' and gl <= close <= gh:
-            score -= 1
-            reasons.append('FVG imbalance (bearish gap)')
-
-    return max(-4, min(4, score)), ', '.join(reasons) if reasons else 'neutral'
-
-def calculate_confluence(ind: dict, mode: str) -> dict:
+def calculate_confluence(ind: dict, mode: str, sdz_result: dict = None) -> dict:
     layers = {
         'trend': score_trend(ind, mode),
         'momentum': score_momentum(ind, mode),
         'volatility': score_volatility(ind, mode),
         'volume': score_volume(ind, mode),
-        'pattern': score_pattern(ind, mode),
+        'pattern': score_sdz(sdz_result) if sdz_result else (0, 'SDZ not ready'),
     }
 
     weights = LAYER_WEIGHTS[mode]
@@ -335,7 +262,7 @@ def calculate_confluence(ind: dict, mode: str) -> dict:
         'total_weighted': total_weighted,
     }
 
-def calculate_sl_tp(ind: dict, mode: str, signal: str) -> dict:
+def calculate_sl_tp(ind: dict, mode: str, signal: str, sdz_triggers: list = None) -> dict:
     atr = ind.get('atr', 0)
     close = ind.get('close', 0)
     if atr == 0 or close == 0:
@@ -358,6 +285,38 @@ def calculate_sl_tp(ind: dict, mode: str, signal: str) -> dict:
         min_rr = 3.0
 
     is_buy = signal in ('strong_buy', 'buy', 'weak_buy')
+
+    if sdz_triggers:
+        t = sdz_triggers[0]
+        entry_bid = t.get('entry', close)
+        sl_ask = t.get('sl', 0)
+        risk = abs(entry_bid - sl_ask)
+        tp1 = t.get('tp1', 0) if is_buy else t.get('tp1', 0)
+        tp2 = t.get('tp2', 0) if is_buy else t.get('tp2', 0)
+        tp3 = t.get('tp3', 0)
+        sl = sl_ask if is_buy else sl_ask
+        sl_pips = round(risk, 5)
+        tp1_pips = round(abs(tp1 - entry_bid), 5)
+        rr1 = round(tp1_pips / sl_pips, 2) if sl_pips > 0 else 0
+        tp2_pips = round(abs(tp2 - entry_bid), 5)
+        rr2 = round(tp2_pips / sl_pips, 2) if sl_pips > 0 else 0
+        rr_ok = rr1 >= min_rr - 0.02 if min_rr else False
+        return {
+            'entry_zone_high': round(entry_bid * 1.0001, 5),
+            'entry_zone_low': round(entry_bid * 0.9999, 5),
+            'sl': round(sl_ask, 5),
+            'tp1': round(tp1, 5),
+            'tp2': round(tp2, 5),
+            'sl_pips': sl_pips,
+            'tp1_pips': tp1_pips,
+            'rr1': rr1,
+            'rr2': rr2,
+            'min_rr': min_rr,
+            'rr_ok': rr_ok,
+            'atr_used': atr,
+            'sdz_entry': True,
+        }
+
     sl = round(close - (atr * sl_mult) if is_buy else close + (atr * sl_mult), 5)
     tp1 = round(close + (atr * tp1_mult) if is_buy else close - (atr * tp1_mult), 5)
     tp2 = round(close + (atr * tp2_mult) if is_buy else close - (atr * tp2_mult), 5)
@@ -384,7 +343,7 @@ def calculate_sl_tp(ind: dict, mode: str, signal: str) -> dict:
         'atr_used': atr,
     }
 
-def validate_trading_plan(ind: dict, mode: str, higher_tf_signal: str = None, entry_ma: str = None) -> dict:
+def validate_trading_plan(ind: dict, mode: str, higher_tf_signal: str = None, entry_ma: str = None, sdz_result: dict = None) -> dict:
     conditions = {}
 
     ma = ind.get('ma_alignment', 'mixed')
@@ -405,18 +364,25 @@ def validate_trading_plan(ind: dict, mode: str, higher_tf_signal: str = None, en
         'detail': f'RSI {rsi} ({ "valid" if cond2_pass else "OUT OF" } 30-70 range)',
     }
 
-    pat = ind.get('pattern', 'none')
-    bullish_patterns = ['bullish_engulfing', 'hammer', 'morning_star', 'marubozu_bullish']
-    bearish_patterns = ['bearish_engulfing', 'shooting_star', 'evening_star', 'marubozu_bearish']
-    s1 = ind.get('support_1', 0)
-    at_support = s1 and close and abs(close - s1) / close < 0.005
-    r1 = ind.get('resistance_1', 0)
-    at_resistance = r1 and close and abs(r1 - close) / close < 0.005
+    sdz_triggers = []
+    sdz_active = False
+    if sdz_result and sdz_result.get('status') == 'active':
+        sdz_triggers = sdz_result.get('triggers', [])
+        sdz_active = True
 
-    reversal_at_level = (pat in bullish_patterns and at_support) or (pat in bearish_patterns and at_resistance)
-    conditions['reversal_at_level'] = {
-        'pass': reversal_at_level,
-        'detail': f'Pattern {pat}' + (' at support' if at_support and pat in bullish_patterns else ' at resistance' if at_resistance and pat in bearish_patterns else ' (not at level)' if pat in bullish_patterns + bearish_patterns else ' (no reversal)'),
+    timing_pass = sdz_active and len(sdz_triggers) > 0
+    if sdz_active:
+        if sdz_triggers:
+            t = sdz_triggers[0]
+            timing_detail = f"SDZ trigger: {t['direction'].upper()} ({t['confirmation']}) at {t['zone_type']} zone"
+        else:
+            timing_detail = 'SDZ active — no trigger (zone proximity tanpa konfirmasi reversal)'
+    else:
+        timing_detail = 'SDZ engine not ready'
+
+    conditions['sdz_trigger'] = {
+        'pass': timing_pass,
+        'detail': timing_detail,
     }
 
     cond4_pass = higher_tf_signal is None or 'neutral' in higher_tf_signal or False
@@ -455,13 +421,14 @@ def validate_trading_plan(ind: dict, mode: str, higher_tf_signal: str = None, en
         'score': f'{pass_count}/{len(conditions)}',
     }
 
-def full_analysis(df: pd.DataFrame, mode: str, symbol: str) -> dict:
+def full_analysis(df: pd.DataFrame, mode: str, symbol: str, sdz_result: dict = None) -> dict:
     ind = compute_indicators(df, mode)
     if 'error' in ind:
         return {'error': ind['error']}
 
-    confluence = calculate_confluence(ind, mode)
-    sl_tp = calculate_sl_tp(ind, mode, confluence['signal'])
+    confluence = calculate_confluence(ind, mode, sdz_result)
+    sl_tp = calculate_sl_tp(ind, mode, confluence['signal'],
+                            sdz_result.get('triggers') if sdz_result else None)
 
     if 'error' not in sl_tp and not sl_tp.get('rr_ok', True):
         confluence['confidence'] = round(confluence['confidence'] * 0.7, 1)
@@ -505,10 +472,7 @@ def full_analysis(df: pd.DataFrame, mode: str, symbol: str) -> dict:
             'volume_ratio': ind.get('volume_ratio'),
             'obv': ind.get('obv'),
             'obv_trend': ind.get('obv_trend'),
-            'pattern': ind.get('pattern'),
             'trend_structure': ind.get('trend_structure'),
-            'supply_demand': ind.get('supply_demand'),
-            'fvg': ind.get('fvg'),
         },
         'support_resistance': {
             'support_1': ind.get('support_1'),
@@ -519,4 +483,13 @@ def full_analysis(df: pd.DataFrame, mode: str, symbol: str) -> dict:
         },
         'confluence': confluence,
         'execution': sl_tp,
+        'sdz': {
+            'status': sdz_result.get('status') if sdz_result else None,
+            'total_zones': sdz_result.get('total_zones', 0) if sdz_result else 0,
+            'active_triggers': len(sdz_result.get('triggers', [])) if sdz_result else 0,
+            'regime': sdz_result.get('regime') if sdz_result else None,
+            'zones': sdz_result.get('zones') if sdz_result else None,
+            'triggers': sdz_result.get('triggers') if sdz_result else None,
+            'atr': sdz_result.get('atr') if sdz_result else None,
+        } if sdz_result else None,
     }
